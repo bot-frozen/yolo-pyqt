@@ -153,6 +153,7 @@ class BasePredictor:
         """
         same_shapes = len({x.shape for x in im}) == 1
         letterbox = LetterBox(self.imgsz, auto=same_shapes and self.model.pt, stride=self.model.stride)
+        # letterbox = LetterBox(self.imgsz, auto=False and self.model.pt, stride=self.model.stride)
         return [letterbox(image=x) for x in im]
 
     def postprocess(self, preds, img, orig_imgs):

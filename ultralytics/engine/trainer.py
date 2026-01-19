@@ -48,7 +48,9 @@ from ultralytics.utils.torch_utils import (
     one_cycle,
     select_device,
     strip_optimizer,
+    torch_distributed_zero_first,
 )
+from ultralytics.nn.extra_modules.kernel_warehouse import get_temperature
 
 
 class BaseTrainer:
@@ -127,7 +129,8 @@ class BaseTrainer:
 
         # Model and Dataset
         self.model = check_model_file_from_stem(self.args.model)  # add suffix, i.e. yolov8n -> yolov8n.pt
-        self.trainset, self.testset = self.get_dataset()
+        with torch_distributed_zero_first(RANK):  # avoid auto-downloading dataset multiple times
+            self.trainset, self.testset = self.get_dataset()
         self.ema = None
 
         # Optimization utils init
@@ -142,6 +145,9 @@ class BaseTrainer:
         self.loss_names = ["Loss"]
         self.csv = self.save_dir / "results.csv"
         self.plot_idx = [0, 1, 2]
+
+        # HUB
+        self.hub_session = None
 
         # Callbacks
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
@@ -243,12 +249,12 @@ class BaseTrainer:
             if any(x in k for x in freeze_layer_names):
                 LOGGER.info(f"Freezing layer '{k}'")
                 v.requires_grad = False
-            elif not v.requires_grad and v.dtype.is_floating_point:  # only floating point Tensor can require gradients
-                LOGGER.info(
-                    f"WARNING ⚠️ setting 'requires_grad=True' for frozen layer '{k}'. "
-                    "See ultralytics.engine.trainer for customization of frozen layers."
-                )
-                v.requires_grad = True
+            # elif not v.requires_grad and v.dtype.is_floating_point:  # only floating point Tensor can require gradients
+            #     LOGGER.info(
+            #         f"WARNING ⚠️ setting 'requires_grad=True' for frozen layer '{k}'. "
+            #         "See ultralytics.engine.trainer for customization of frozen layers."
+            #     )
+            #     v.requires_grad = True
 
         # Check AMP
         self.amp = torch.tensor(self.args.amp).to(self.device)  # True or False
@@ -261,7 +267,7 @@ class BaseTrainer:
         self.amp = bool(self.amp)  # as boolean
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)
         if world_size > 1:
-            self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK])
+            self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
 
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
@@ -370,6 +376,10 @@ class BaseTrainer:
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
 
+                if hasattr(self.model, 'net_update_temperature'):
+                    temp = get_temperature(i + 1, epoch, len(self.train_loader), temp_epoch=20, temp_init_value=1.0)
+                    self.model.net_update_temperature(temp)
+
                 # Forward
                 with torch.cuda.amp.autocast(self.amp):
                     batch = self.preprocess_batch(batch)
@@ -476,33 +486,52 @@ class BaseTrainer:
         import pandas as pd  # scope for faster 'import ultralytics'
 
         # Serialize ckpt to a byte buffer once (faster than repeated torch.save() calls)
-        buffer = io.BytesIO()
-        torch.save(
-            {
-                "epoch": self.epoch,
-                "best_fitness": self.best_fitness,
-                "model": None,  # resume and final checkpoints derive from EMA
-                "ema": deepcopy(self.ema.ema).half(),
-                "updates": self.ema.updates,
-                "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
-                "train_args": vars(self.args),  # save as dict
-                "train_metrics": {**self.metrics, **{"fitness": self.fitness}},
-                "train_results": {k.strip(): v for k, v in pd.read_csv(self.csv).to_dict(orient="list").items()},
-                "date": datetime.now().isoformat(),
-                "version": __version__,
-                "license": "AGPL-3.0 (https://ultralytics.com/license)",
-                "docs": "https://docs.ultralytics.com",
-            },
-            buffer,
-        )
-        serialized_ckpt = buffer.getvalue()  # get the serialized content to save
+        # buffer = io.BytesIO()
+        # torch.save(
+        #     {
+        #         "epoch": self.epoch,
+        #         "best_fitness": self.best_fitness,
+        #         "model": None,  # resume and final checkpoints derive from EMA
+        #         "ema": deepcopy(self.ema.ema).half(),
+        #         "updates": self.ema.updates,
+        #         "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
+        #         "train_args": vars(self.args),  # save as dict
+        #         "train_metrics": {**self.metrics, **{"fitness": self.fitness}},
+        #         "train_results": {k.strip(): v for k, v in pd.read_csv(self.csv).to_dict(orient="list").items()},
+        #         "date": datetime.now().isoformat(),
+        #         "version": __version__,
+        #         "license": "AGPL-3.0 (https://ultralytics.com/license)",
+        #         "docs": "https://docs.ultralytics.com",
+        #     },
+        #     # buffer,
+        # )
+        # serialized_ckpt = buffer.getvalue()  # get the serialized content to save
+        
+        ckpt = {
+            "epoch": self.epoch,
+            "best_fitness": self.best_fitness,
+            "model": None,  # resume and final checkpoints derive from EMA
+            "ema": deepcopy(self.ema.ema),
+            "updates": self.ema.updates,
+            "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
+            "train_args": vars(self.args),  # save as dict
+            "train_metrics": {**self.metrics, **{"fitness": self.fitness}},
+            "train_results": {k.strip(): v for k, v in pd.read_csv(self.csv).to_dict(orient="list").items()},
+            "date": datetime.now().isoformat(),
+            "version": __version__,
+            "license": "AGPL-3.0 (https://ultralytics.com/license)",
+            "docs": "https://docs.ultralytics.com",
+        }
 
         # Save checkpoints
-        self.last.write_bytes(serialized_ckpt)  # save last.pt
+        # self.last.write_bytes(serialized_ckpt)  # save last.pt
+        torch.save(ckpt, self.last)
         if self.best_fitness == self.fitness:
-            self.best.write_bytes(serialized_ckpt)  # save best.pt
+            # self.best.write_bytes(serialized_ckpt)  # save best.pt
+            torch.save(ckpt, self.best)
         if (self.save_period > 0) and (self.epoch > 0) and (self.epoch % self.save_period == 0):
-            (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)  # save epoch, i.e. 'epoch3.pt'
+            # (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)  # save epoch, i.e. 'epoch3.pt'
+            torch.save(ckpt, self.wdir / f"epoch{self.epoch}.pt")
 
     def get_dataset(self):
         """

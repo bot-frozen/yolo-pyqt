@@ -302,7 +302,7 @@ def test_yolov7_track():
         cv2.waitKey(20)
 
 if __name__ == '__main__':
-    # test_yolov5()
+    test_yolov5()
     # test_yolov7()
-    test_yolov5_track()
-    test_yolov7_track()
+    # test_yolov5_track()
+    # test_yolov7_track()

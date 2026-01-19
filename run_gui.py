@@ -29,6 +29,8 @@ class MyForm(QDialog):
         self.ui = Ui_Dialog()
         self.ui.setupUi(self)
         
+        self.init_ui_slim_and_pretty()
+        
         self.save_path = 'result'
         self.save_id = 0
         if not os.path.exists(self.save_path):
@@ -263,8 +265,106 @@ class MyForm(QDialog):
     def _exit(self):
         self.close()
 
+    def init_ui_slim_and_pretty(self):
+        # 1) 隐藏不需要显示的控件（不删除）
+        for name in ["pushButton_Video", "pushButton_Camera", "comboBox"]:
+            w = getattr(self.ui, name, None)
+            if w is not None:
+                w.setVisible(False)
+
+        # 如果你还有其它控件也想隐藏，就继续往列表里加名字即可
+        # 例如：["spinBox", "checkBox_xxx", "groupBox_xxx" ...]
+
+        # 2) 推荐：不要再监听 comboBox 的变化（避免隐藏了还输出日志）
+        try:
+            self.ui.comboBox.currentIndexChanged.disconnect()
+        except Exception:
+            pass
+
+        # 3) 给按钮换更清晰的文字（可选）
+        self.ui.pushButton_Model.setText("选择配置文件")
+        self.ui.pushButton_Img.setText("打开图片")
+        self.ui.pushButton_ImgFolder.setText("打开文件夹")
+        self.ui.pushButton_BegDet.setText("开始检测")
+        self.ui.pushButton_StopDet.setText("停止检测")
+        self.ui.pushButton_SavePath.setText("设置保存路径")
+        self.ui.pushButton_Exit.setText("退出")
+
+        # 4) 窗口/字体基础设置（可选）
+        self.setWindowTitle(self.ui.label.text() if hasattr(self.ui, "label") else "YOLO 检测工具")
+        font = QtGui.QFont("Microsoft YaHei UI", 10)
+        self.setFont(font)
+
+        # 5) 美化：QSS 统一皮肤（按钮圆角、悬停、文本框等）
+        qss = """
+        QWidget{
+            background:#0f172a;          /* 深色背景 */
+            color:#e5e7eb;               /* 全局文字 */
+            font-family: "Microsoft YaHei UI";
+            font-size: 13px;
+        }
+        QLabel{
+            color:#e5e7eb;
+        }
+        QTextBrowser{
+            background:#111827;
+            border:1px solid rgba(255,255,255,0.10);
+            border-radius:10px;
+            padding:10px;
+            selection-background-color: rgba(99,102,241,0.35);
+        }
+        QPushButton{
+            background: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 10px;
+            padding: 10px 14px;
+            min-height: 34px;
+        }
+        QPushButton:hover{
+            background: rgba(255,255,255,0.14);
+            border: 1px solid rgba(255,255,255,0.18);
+        }
+        QPushButton:pressed{
+            background: rgba(99,102,241,0.25);
+            border: 1px solid rgba(99,102,241,0.45);
+        }
+        QPushButton#pushButton_BegDet{
+            background: rgba(34,197,94,0.20);
+            border: 1px solid rgba(34,197,94,0.35);
+        }
+        QPushButton#pushButton_BegDet:hover{
+            background: rgba(34,197,94,0.28);
+        }
+        QPushButton#pushButton_StopDet{
+            background: rgba(239,68,68,0.18);
+            border: 1px solid rgba(239,68,68,0.32);
+        }
+        QPushButton#pushButton_StopDet:hover{
+            background: rgba(239,68,68,0.26);
+        }
+        QPushButton#pushButton_Exit{
+            background: rgba(148,163,184,0.12);
+            border: 1px solid rgba(148,163,184,0.22);
+        }
+        """
+        self.setStyleSheet(qss)
+
+        # 6) 让图片区更像面板（可选：加边框感）
+        for lb_name in ["label_ori", "label_det"]:
+            lb = getattr(self.ui, lb_name, None)
+            if lb is not None:
+                lb.setStyleSheet("""
+                    QLabel{
+                        background:#0b1220;
+                        border:1px dashed rgba(255,255,255,0.15);
+                        border-radius:12px;
+                    }
+                """)
+                lb.setAlignment(Qt.AlignCenter)
+
+
 if __name__ == '__main__':
-    gui_title = 'Yolov5-VisDrone'
+    gui_title = 'DCD-YOLOv8-VisDrone'
     textBrowser_size = 15
     
     app = QApplication(sys.argv)

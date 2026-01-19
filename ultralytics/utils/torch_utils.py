@@ -7,6 +7,7 @@ import random
 import time
 from contextlib import contextmanager
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 from typing import Union
 
@@ -35,6 +36,7 @@ except ImportError:
 # Version checks (all default to version>=min_version)
 TORCH_1_9 = check_version(torch.__version__, "1.9.0")
 TORCH_1_13 = check_version(torch.__version__, "1.13.0")
+TORCH_1_13_1 = check_version(torch.__version__, "1.13.1")
 TORCH_2_0 = check_version(torch.__version__, "2.0.0")
 TORCHVISION_0_10 = check_version(TORCHVISION_VERSION, "0.10.0")
 TORCHVISION_0_11 = check_version(TORCHVISION_VERSION, "0.11.0")
@@ -43,8 +45,8 @@ TORCHVISION_0_13 = check_version(TORCHVISION_VERSION, "0.13.0")
 
 @contextmanager
 def torch_distributed_zero_first(local_rank: int):
-    """Decorator to make all processes in distributed training wait for each local_master to do something."""
-    initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
+    """Ensures all processes in distributed training wait for the local master (rank 0) to complete a task first."""
+    initialized = dist.is_available() and dist.is_initialized()
     if initialized and local_rank not in {-1, 0}:
         dist.barrier(device_ids=[local_rank])
     yield
@@ -324,13 +326,14 @@ def get_flops(model, imgsz=640):
             imgsz = [imgsz, imgsz]  # expand if int/float
         try:
             # Use stride size for input tensor
-            stride = max(int(model.stride.max()), 32) if hasattr(model, "stride") else 32  # max stride
-            im = torch.empty((1, p.shape[1], stride, stride), device=p.device)  # input image in BCHW format
+            # stride = max(int(model.stride.max()), 32) if hasattr(model, "stride") else 32  # max stride
+            stride = 640
+            im = torch.empty((1, 3, stride, stride), device=p.device)  # input image in BCHW format
             flops = thop.profile(deepcopy(model), inputs=[im], verbose=False)[0] / 1e9 * 2  # stride GFLOPs
             return flops * imgsz[0] / stride * imgsz[1] / stride  # imgsz GFLOPs
         except Exception:
             # Use actual image size for input tensor (i.e. required for RTDETR models)
-            im = torch.empty((1, p.shape[1], *imgsz), device=p.device)  # input image in BCHW format
+            im = torch.empty((1, 3, *imgsz), device=p.device)  # input image in BCHW format
             return thop.profile(deepcopy(model), inputs=[im], verbose=False)[0] / 1e9 * 2  # imgsz GFLOPs
     except Exception:
         return 0.0
@@ -443,27 +446,30 @@ def init_seeds(seed=0, deterministic=False):
     torch.cuda.manual_seed_all(seed)  # for Multi-GPU, exception safe
     # torch.backends.cudnn.benchmark = True  # AutoBatch problem https://github.com/ultralytics/yolov5/issues/9287
     if deterministic:
-        if TORCH_2_0:
+        if TORCH_1_13_1:
             torch.use_deterministic_algorithms(True, warn_only=True)  # warn if deterministic is not possible
             torch.backends.cudnn.deterministic = True
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
             os.environ["PYTHONHASHSEED"] = str(seed)
         else:
-            LOGGER.warning("WARNING ⚠️ Upgrade to torch>=2.0.0 for deterministic training.")
+            LOGGER.warning("WARNING ⚠️ Upgrade to torch>=1.13.1 for deterministic training.")
     else:
         torch.use_deterministic_algorithms(False)
         torch.backends.cudnn.deterministic = False
 
 
 class ModelEMA:
-    """Updated Exponential Moving Average (EMA) from https://github.com/rwightman/pytorch-image-models
-    Keeps a moving average of everything in the model state_dict (parameters and buffers)
+    """
+    Updated Exponential Moving Average (EMA) from https://github.com/rwightman/pytorch-image-models. Keeps a moving
+    average of everything in the model state_dict (parameters and buffers)
+
     For EMA details see https://www.tensorflow.org/api_docs/python/tf/train/ExponentialMovingAverage
+
     To disable EMA set the `enabled` attribute to `False`.
     """
 
     def __init__(self, model, decay=0.9999, tau=2000, updates=0):
-        """Create EMA."""
+        """Initialize EMA for 'model' with given arguments."""
         self.ema = deepcopy(de_parallel(model)).eval()  # FP32 EMA
         self.updates = updates  # number of EMA updates
         self.decay = lambda x: decay * (1 - math.exp(-x / tau))  # decay exponential ramp (to help early epochs)
@@ -489,6 +495,13 @@ class ModelEMA:
         if self.enabled:
             copy_attr(self.ema, model, include, exclude)
 
+def add_suffix_to_pt_file(path, suffix="_fp32"):
+    dir_name, base_name = os.path.split(str(path))
+    name, ext = os.path.splitext(base_name)
+    if ext != ".pt":
+        raise ValueError(f"Expected a .pt file, got {ext}")
+    new_name = f"{name}{suffix}{ext}"
+    return Path(os.path.join(dir_name, new_name))
 
 def strip_optimizer(f: Union[str, Path] = "best.pt", s: str = "") -> None:
     """
@@ -506,31 +519,67 @@ def strip_optimizer(f: Union[str, Path] = "best.pt", s: str = "") -> None:
         from pathlib import Path
         from ultralytics.utils.torch_utils import strip_optimizer
 
-        for f in Path('path/to/weights').rglob('*.pt'):
+        for f in Path('path/to/model/checkpoints').rglob('*.pt'):
             strip_optimizer(f)
         ```
     """
-    x = torch.load(f, map_location=torch.device("cpu"))
-    if "model" not in x:
-        LOGGER.info(f"Skipping {f}, not a valid Ultralytics model.")
+    try:
+        try:
+            x = torch.load(f, map_location=torch.device("cpu"))
+        except:
+            x = torch.load(f, map_location=torch.device("cpu"), weights_only=False)
+        assert isinstance(x, dict), "checkpoint is not a Python dictionary"
+        assert "model" in x, "'model' missing from checkpoint"
+    except Exception as e:
+        LOGGER.warning(f"WARNING ⚠️ Skipping {f}, not a valid Ultralytics model: {e}")
         return
 
+    updates = {
+        "date": datetime.now().isoformat(),
+        "version": __version__,
+        "license": "AGPL-3.0 License (https://ultralytics.com/license)",
+        "docs": "https://docs.ultralytics.com",
+    }
+
+    # Update model
+    if x.get("ema"):
+        x["model"] = x["ema"]  # replace model with EMA
     if hasattr(x["model"], "args"):
         x["model"].args = dict(x["model"].args)  # convert from IterableSimpleNamespace to dict
-    args = {**DEFAULT_CFG_DICT, **x["train_args"]} if "train_args" in x else None  # combine args
-    if x.get("ema"):
-        x["model"] = x["ema"]  # replace model with ema
+    if hasattr(x["model"], "criterion"):
+        x["model"].criterion = None  # strip loss criterion
+    try:
+        x_model_fp32 = deepcopy(x["model"])
+        for p in x_model_fp32.parameters():
+            p.requires_grad = False
+    except:
+        x_model_fp32 = None
+    x_model_fp16 = x["model"].half()  # to FP16
+    for p in x["model"].parameters():
+        p.requires_grad = False
+
+    # Update other keys
+    args = {**DEFAULT_CFG_DICT, **x.get("train_args", {})}  # combine args
     for k in "optimizer", "best_fitness", "ema", "updates":  # keys
         x[k] = None
     x["epoch"] = -1
-    x["model"].half()  # to FP16
-    for p in x["model"].parameters():
-        p.requires_grad = False
     x["train_args"] = {k: v for k, v in args.items() if k in DEFAULT_CFG_KEYS}  # strip non-default keys
     # x['model'].args = x['train_args']
-    torch.save(x, s or f)
-    mb = os.path.getsize(s or f) / 1e6  # file size
-    LOGGER.info(f"Optimizer stripped from {f},{f' saved as {s},' if s else ''} {mb:.1f}MB")
+
+    if x_model_fp32:
+        x["model"] = x_model_fp32
+        combined_fp32 = {**updates, **x}, s or f
+        torch.save(combined_fp32, add_suffix_to_pt_file(s or f))  # combine dicts (prefer to the right)
+
+    # Save
+    x["model"] = x_model_fp16
+    torch.save({**updates, **x}, s or f)  # combine dicts (prefer to the right)
+    mb_fp16 = os.path.getsize(s or f) / 1e6  # file size
+    LOGGER.info(f"FP16|Optimizer stripped from {f},{f' saved as {s},' if s else ''} {mb_fp16:.1f}MB")
+
+    if x_model_fp32:
+        mb_fp32 = os.path.getsize(add_suffix_to_pt_file(s or f)) / 1e6  # file size
+        LOGGER.info(f"FP32|Optimizer stripped from {f},{f' saved as {s},' if s else ''} {mb_fp32:.1f}MB")
 
 
 def convert_optimizer_state_dict_to_fp16(state_dict):
